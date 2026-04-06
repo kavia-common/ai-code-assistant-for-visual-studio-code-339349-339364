@@ -1,0 +1,4 @@
+{
+    "command": "npm run test",
+    "working_directory": "/home/kavia/workspace/code-generation/ai-code-assistant-for-visual-studio-code-339349-339364/react_webview_ui"
+}
