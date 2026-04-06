@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
+import { createNodeBackendClient } from './api/nodeBackendClient';
 
 /**
  * Returns the VS Code webview API if available, otherwise returns a stub that
@@ -47,6 +48,83 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+function toUiMessage(m) {
+  // Backend message shape: {id, sessionId, role, content, createdAtMs}
+  // UI message shape: {id, role, content, ts}
+  const ts = typeof m?.createdAtMs === 'number' ? new Date(m.createdAtMs).toISOString() : nowIso();
+  return { id: m.id || `m-${Date.now()}`, role: m.role, content: String(m.content ?? ''), ts };
+}
+
+/**
+ * Canonical browser smoke flow:
+ * - Load settings from backend.
+ * - Ensure a session exists (persisted).
+ * - Load messages for that session.
+ * This gives the “save settings → send chat → reload persisted history” E2E path.
+ */
+async function browserSmokeHydrate({ client, addLog }) {
+  const result = {
+    settings: null,
+    telemetryPref: null,
+    sessionId: null,
+    messages: [],
+  };
+
+  addLog('SmokeHydrate: start');
+
+  // Settings
+  try {
+    const settings = await client.getSettings();
+    result.settings = settings;
+    addLog(`SmokeHydrate: loaded settings (${(settings?.items || []).length} keys)`);
+  } catch (e) {
+    addLog(`SmokeHydrate: settings load failed (${e.status || 'no-status'}): ${String(e)}`);
+  }
+
+  // Telemetry preference
+  try {
+    const pref = await client.getTelemetryPreference();
+    result.telemetryPref = pref;
+    addLog(`SmokeHydrate: loaded telemetry preference (optedIn=${!!pref?.isOptedIn})`);
+  } catch (e) {
+    addLog(`SmokeHydrate: telemetry pref load failed (${e.status || 'no-status'}): ${String(e)}`);
+  }
+
+  // Ensure session exists
+  const sessionKey = 'ui_active_session_id';
+  let sessionId = null;
+  try {
+    const row = await client.getSetting(sessionKey);
+    sessionId = row?.value || null;
+  } catch (e) {
+    addLog(`SmokeHydrate: getSetting(${sessionKey}) failed: ${String(e)}`);
+  }
+
+  if (!sessionId) {
+    const created = await client.createSession({ title: 'Default session', providerConfigId: null });
+    sessionId = created.id;
+    await client.putSetting(sessionKey, sessionId);
+    addLog(`SmokeHydrate: created session ${sessionId}`);
+  } else {
+    addLog(`SmokeHydrate: found existing session ${sessionId}`);
+  }
+
+  result.sessionId = sessionId;
+
+  // Messages
+  try {
+    const msgResp = await client.listMessages({ sessionId, limit: 200, offset: 0 });
+    const items = msgResp?.items || [];
+    result.messages = items.map(toUiMessage);
+    addLog(`SmokeHydrate: loaded ${items.length} messages`);
+  } catch (e) {
+    addLog(`SmokeHydrate: messages load failed: ${String(e)}`);
+  }
+
+  addLog('SmokeHydrate: end');
+  return result;
+}
+
 // PUBLIC_INTERFACE
 function App() {
   /**
@@ -55,17 +133,19 @@ function App() {
    * In browser: it is a stub (still functional for UI/dev/testing).
    */
   const vscode = useMemo(() => acquireVsCodeApiSafe(), []);
+  const isInVsCodeWebview = typeof window.acquireVsCodeApi === 'function';
 
   const transcriptEndRef = useRef(null);
   const [leftWidth, setLeftWidth] = useState(320);
 
-  // Settings state (persisted via vscode.setState / getState).
+  // Settings state
   const [providerId, setProviderId] = useState('openai');
   const [model, setModel] = useState('gpt-4o-mini');
   const [temperature, setTemperature] = useState(0.2);
   const [telemetryOptIn, setTelemetryOptIn] = useState(false);
 
   // Chat state
+  const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState(() => [
     {
       id: 'm1',
@@ -89,12 +169,16 @@ function App() {
   const addLog = useCallback((line) => {
     setLogs((prev) => {
       const next = prev.concat([{ id: `${Date.now()}-${Math.random()}`, ts: nowIso(), line }]);
-      // Keep logs bounded so the webview stays snappy
       return next.slice(-400);
     });
   }, []);
 
-  // Hydrate persisted state (if any)
+  const backendClient = useMemo(() => {
+    // Only used in browser mode. In VS Code mode, the extension should proxy calls.
+    return createNodeBackendClient();
+  }, []);
+
+  // Hydrate persisted UI state (VS Code webview state) if any
   useEffect(() => {
     const state = vscode.getState?.();
     if (!state) return;
@@ -104,11 +188,12 @@ function App() {
     if (typeof state.temperature === 'number') setTemperature(state.temperature);
     if (typeof state.telemetryOptIn === 'boolean') setTelemetryOptIn(state.telemetryOptIn);
     if (Array.isArray(state.messages)) setMessages(state.messages);
+    if (typeof state.activeSessionId === 'string') setActiveSessionId(state.activeSessionId);
 
     addLog('Hydrated UI state from vscode.getState()');
   }, [addLog, vscode]);
 
-  // Persist state changes
+  // Persist UI state changes (webview only)
   useEffect(() => {
     vscode.setState?.({
       providerId,
@@ -116,21 +201,54 @@ function App() {
       temperature,
       telemetryOptIn,
       messages,
+      activeSessionId,
     });
-  }, [messages, model, providerId, telemetryOptIn, temperature, vscode]);
+  }, [activeSessionId, messages, model, providerId, telemetryOptIn, temperature, vscode]);
+
+  // Browser smoke hydrate from backend for E2E contract validation
+  useEffect(() => {
+    if (isInVsCodeWebview) return;
+
+    let isCancelled = false;
+    (async () => {
+      try {
+        const hydrated = await browserSmokeHydrate({ client: backendClient, addLog });
+        if (isCancelled) return;
+
+        // Apply telemetry preference first (source of truth in browser mode)
+        if (typeof hydrated?.telemetryPref?.isOptedIn === 'boolean') {
+          setTelemetryOptIn(hydrated.telemetryPref.isOptedIn);
+        }
+
+        setActiveSessionId(hydrated.sessionId);
+
+        // If backend already has history, show it; otherwise keep the welcome message.
+        if (hydrated.messages && hydrated.messages.length > 0) {
+          setMessages(hydrated.messages);
+        } else {
+          addLog('No persisted messages yet; showing welcome message.');
+        }
+      } catch (e) {
+        addLog(`SmokeHydrate failed: ${String(e)}`);
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [addLog, backendClient, isInVsCodeWebview]);
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages]);
 
-  // Handle incoming messages from extension/backend
+  // Handle incoming messages from extension/backend (VS Code webview mode)
   useEffect(() => {
     function onMessage(event) {
       const msg = event?.data;
       if (!msg || typeof msg !== 'object') return;
 
-      // The extension should use postMessage({ type: '...', ... })
       const { type } = msg;
 
       if (type === 'assistantMessage') {
@@ -166,7 +284,6 @@ function App() {
       }
 
       if (type === 'setSettings') {
-        // Allows backend/extension to push settings changes.
         addLog('Received setSettings');
         if (msg.providerId) setProviderId(msg.providerId);
         if (typeof msg.model === 'string') setModel(msg.model);
@@ -199,7 +316,21 @@ function App() {
     [addLog, vscode]
   );
 
-  const onSend = useCallback(() => {
+  const persistSettingBrowser = useCallback(
+    async (key, value) => {
+      // Only persists in browser mode; VS Code mode should be handled by extension.
+      if (isInVsCodeWebview) return;
+      try {
+        await backendClient.putSetting(key, value);
+        addLog(`Persisted setting to backend: ${key}`);
+      } catch (e) {
+        addLog(`Persist setting failed (${key}): ${String(e)}`);
+      }
+    },
+    [addLog, backendClient, isInVsCodeWebview]
+  );
+
+  const onSend = useCallback(async () => {
     const text = composerText.trim();
     if (!text || isSending) return;
 
@@ -208,6 +339,7 @@ function App() {
     setComposerText('');
     setIsSending(true);
 
+    // Always notify extension bridge (contract preserved).
     sendToExtension({
       type: 'chatUserMessage',
       message: userMsg,
@@ -219,23 +351,94 @@ function App() {
       },
     });
 
-    // In browser stub mode we can simulate an assistant response for UX/testing.
-    if (typeof window.acquireVsCodeApi !== 'function') {
-      window.setTimeout(() => {
-        window.postMessage(
-          {
-            type: 'assistantMessage',
-            id: `stub-a-${Date.now()}`,
-            content:
-              `Stub reply (not running in VS Code):\n\nYou said: "${text}"\n\n` +
-              `Provider: ${providerId}\nModel: ${model}\nTemp: ${temperature}`,
-            ts: nowIso(),
-          },
-          '*'
-        );
-      }, 350);
+    // Browser mode: call node_backend REST API and persist history.
+    if (!isInVsCodeWebview) {
+      try {
+        if (!activeSessionId) {
+          // Defensive: hydrate should have created it, but keep flow non-patchy and robust.
+          const created = await backendClient.createSession({ title: 'Default session', providerConfigId: null });
+          setActiveSessionId(created.id);
+          await backendClient.putSetting('ui_active_session_id', created.id);
+          addLog(`Created session (late): ${created.id}`);
+        }
+
+        const sessionId = activeSessionId || (await backendClient.getSetting('ui_active_session_id'))?.value;
+        if (!sessionId) throw new Error('No sessionId available for sending message');
+
+        // Save UI settings into backend settings for smoke flow verification.
+        await persistSettingBrowser('ui_providerId', providerId);
+        await persistSettingBrowser('ui_model', model);
+        await persistSettingBrowser('ui_temperature', temperature);
+        await backendClient.setTelemetryPreference(telemetryOptIn);
+
+        const result = await backendClient.sendMessage({
+          sessionId,
+          content: text,
+          providerConfigId: null,
+          apiKey: null,
+        });
+
+        const appended = result?.messagesAppended || [];
+        const assistantAndTools = appended
+          .filter((m) => m.role === 'assistant' || m.role === 'tool')
+          .map(toUiMessage);
+
+        if (assistantAndTools.length > 0) {
+          setMessages((prev) => prev.concat(assistantAndTools));
+        } else {
+          // Should not happen; but keep UX stable.
+          setMessages((prev) =>
+            prev.concat([
+              {
+                id: `a-${Date.now()}`,
+                role: 'assistant',
+                content: 'No assistant response received.',
+                ts: nowIso(),
+              },
+            ])
+          );
+        }
+
+        setIsSending(false);
+        return;
+      } catch (e) {
+        // Handle confirmation-required contract (backend uses AppError mapping).
+        if (e && e.status === 409 && e.payload && e.payload.code === 'CONFIRMATION_REQUIRED') {
+          const confirmationId = e.payload?.details?.confirmationId;
+          addLog(`Backend requires confirmation: ${confirmationId || 'unknown'}`);
+          setConfirmState({
+            title: 'Confirmation required',
+            message: `A sensitive operation requires approval before continuing.\n\nOperation: ${
+              e.payload?.details?.operation || 'unknown'
+            }\n\nOpen logs for details.`,
+            requestId: confirmationId || `conf-${Date.now()}`,
+            payload: { action: 'backendConfirmation', confirmationId },
+          });
+          // Leave isSending true until resolved (or cancel sets false).
+          return;
+        }
+
+        addLog(`Backend send failed: ${String(e)} ${e?.payload ? JSON.stringify(e.payload) : ''}`);
+        setIsSending(false);
+        return;
+      }
     }
-  }, [composerText, isSending, model, providerId, sendToExtension, telemetryOptIn, temperature]);
+
+    // VS Code webview: extension should respond with assistantMessage.
+  }, [
+    activeSessionId,
+    addLog,
+    backendClient,
+    composerText,
+    isInVsCodeWebview,
+    isSending,
+    model,
+    persistSettingBrowser,
+    providerId,
+    sendToExtension,
+    telemetryOptIn,
+    temperature,
+  ]);
 
   const onComposerKeyDown = useCallback(
     (e) => {
@@ -257,13 +460,13 @@ function App() {
     });
   }, []);
 
-  const confirmAccept = useCallback(() => {
+  const confirmAccept = useCallback(async () => {
     if (!confirmState) return;
 
     const { requestId, payload } = confirmState;
     setConfirmState(null);
 
-    // Local actions:
+    // Local UI action: clear transcript
     if (payload?.action === 'clearChat') {
       setMessages([
         {
@@ -278,36 +481,68 @@ function App() {
       return;
     }
 
-    // Default: respond to a backend confirmation request.
+    // Browser mode: resolve backend confirmation
+    if (!isInVsCodeWebview && payload?.action === 'backendConfirmation' && payload?.confirmationId) {
+      try {
+        await backendClient.decideConfirmation({ confirmationId: payload.confirmationId, decision: 'approved' });
+        addLog(`Confirmation approved: ${payload.confirmationId}`);
+
+        // After approving, user can re-send; keep deterministic behavior by ending current send.
+        setIsSending(false);
+      } catch (e) {
+        addLog(`Failed to approve confirmation: ${String(e)}`);
+        setIsSending(false);
+      }
+      return;
+    }
+
+    // VS Code webview: respond to a backend confirmation request via extension
     sendToExtension({ type: 'confirmationResponse', requestId, accepted: true });
-  }, [confirmState, sendToExtension]);
+  }, [addLog, backendClient, confirmState, isInVsCodeWebview, sendToExtension]);
 
-  const confirmCancel = useCallback(() => {
+  const confirmCancel = useCallback(async () => {
     if (!confirmState) return;
-    const { requestId } = confirmState;
+    const { requestId, payload } = confirmState;
     setConfirmState(null);
+
+    if (!isInVsCodeWebview && payload?.action === 'backendConfirmation' && payload?.confirmationId) {
+      try {
+        await backendClient.decideConfirmation({ confirmationId: payload.confirmationId, decision: 'rejected' });
+        addLog(`Confirmation rejected: ${payload.confirmationId}`);
+      } catch (e) {
+        addLog(`Failed to reject confirmation: ${String(e)}`);
+      } finally {
+        setIsSending(false);
+      }
+      return;
+    }
+
+    setIsSending(false);
     sendToExtension({ type: 'confirmationResponse', requestId, accepted: false });
-  }, [confirmState, sendToExtension]);
+  }, [addLog, backendClient, confirmState, isInVsCodeWebview, sendToExtension]);
 
-  const beginResize = useCallback((e) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = leftWidth;
+  const beginResize = useCallback(
+    (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = leftWidth;
 
-    function onMove(ev) {
-      const delta = ev.clientX - startX;
-      setLeftWidth(clamp(startWidth + delta, 240, 520));
-    }
-    function onUp() {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      document.body.classList.remove('is-resizing');
-    }
+      function onMove(ev) {
+        const delta = ev.clientX - startX;
+        setLeftWidth(clamp(startWidth + delta, 240, 520));
+      }
+      function onUp() {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        document.body.classList.remove('is-resizing');
+      }
 
-    document.body.classList.add('is-resizing');
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-  }, [leftWidth]);
+      document.body.classList.add('is-resizing');
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    },
+    [leftWidth]
+  );
 
   const selectedProviderName = useMemo(() => {
     return PROVIDERS.find((p) => p.id === providerId)?.name || providerId;
@@ -346,6 +581,7 @@ function App() {
                 const next = e.target.value;
                 setProviderId(next);
                 sendToExtension({ type: 'settingsChanged', key: 'providerId', value: next });
+                persistSettingBrowser('ui_providerId', next);
               }}
             >
               {PROVIDERS.map((p) => (
@@ -371,7 +607,10 @@ function App() {
               className="input"
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              onBlur={() => sendToExtension({ type: 'settingsChanged', key: 'model', value: model })}
+              onBlur={() => {
+                sendToExtension({ type: 'settingsChanged', key: 'model', value: model });
+                persistSettingBrowser('ui_model', model);
+              }}
               placeholder="e.g. gpt-4.1-mini / claude-3.5-sonnet / llama3"
               spellCheck={false}
             />
@@ -391,9 +630,10 @@ function App() {
                 const next = Number(e.target.value);
                 setTemperature(next);
               }}
-              onMouseUp={() =>
-                sendToExtension({ type: 'settingsChanged', key: 'temperature', value: temperature })
-              }
+              onMouseUp={() => {
+                sendToExtension({ type: 'settingsChanged', key: 'temperature', value: temperature });
+                persistSettingBrowser('ui_temperature', temperature);
+              }}
             />
           </div>
 
@@ -404,25 +644,38 @@ function App() {
               <input
                 type="checkbox"
                 checked={telemetryOptIn}
-                onChange={(e) => {
+                onChange={async (e) => {
                   const next = e.target.checked;
                   setTelemetryOptIn(next);
                   sendToExtension({ type: 'settingsChanged', key: 'telemetryOptIn', value: next });
+
+                  if (!isInVsCodeWebview) {
+                    try {
+                      await backendClient.setTelemetryPreference(next);
+                      addLog(`Telemetry preference persisted (optedIn=${next})`);
+                    } catch (err) {
+                      addLog(`Telemetry preference persist failed: ${String(err)}`);
+                    }
+                  }
                 }}
               />
               <span>Opt into telemetry</span>
             </label>
 
             <div className="hint">
-              Telemetry is optional. When enabled, only minimal usage metrics should be sent by the
-              extension.
+              Telemetry is optional. When enabled, only minimal usage metrics should be sent by the extension.
             </div>
           </div>
 
           <div className="sidebarFooter">
             <div className="mono small">
-              Bridge: {typeof window.acquireVsCodeApi === 'function' ? 'VS Code' : 'Browser stub'}
+              Bridge: {isInVsCodeWebview ? 'VS Code' : 'Browser + node_backend REST'}
             </div>
+            {!isInVsCodeWebview && (
+              <div className="mono small dim" style={{ marginTop: 6 }}>
+                Session: {activeSessionId ? activeSessionId : 'loading…'}
+              </div>
+            )}
           </div>
         </aside>
 
